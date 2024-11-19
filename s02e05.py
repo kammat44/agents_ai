@@ -1,23 +1,24 @@
 import os
 import requests
 import sys
+sys.path.append("C:\\Users\\kamyk\\Documents\\01_PROJECTS\\AI_DEVS_3")
 from bs4 import BeautifulSoup
 import json
 from openai import OpenAI
-import base64
-from pathlib import Path
-from urllib.parse import urlparse, urljoin
-from langchain_openai import OpenAIEmbeddings
+from urllib.parse import  urljoin
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.chat_models import ChatOpenAI
-import faiss
-from langchain_community.docstore.in_memory import InMemoryDocstore
 from langchain_community.vectorstores import FAISS
-from langchain.chains import RetrievalQA
+from langchain_openai.chat_models import ChatOpenAI
+from langchain_openai.embeddings import OpenAIEmbeddings
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain import hub
 from dotenv import load_dotenv
 from modules.ImageRecognizer import ImageRecognizer
 from modules.Transcriber import Transcriber
-
+from modules.Responder import ReportSenderAnswerJson
 
 
 
@@ -123,42 +124,63 @@ class IndexHtml:
                 text_content += transcription + "\n"
 
         # Zwróć pełny tekst strony
+        # Save text_content to context.txt in the specified directory        
+        temp_dir = os.path.join(dir, 'temp')
+        os.makedirs(temp_dir, exist_ok=True)
+        context_file_path = os.path.join(temp_dir, 'context.txt')
+        
+        with open(context_file_path, 'w', encoding='utf-8') as file:
+            file.write(text_content)
+            
         return text_content
 
 
 
 class KnowledgeDb:
     
-    def __init__(self, openai_api_key):
-        self.openai_api_key = openai_api_key
+    def __init__(self, api_key):
+        self.api_key = api_key
 
     def prepare_knowledge_base(self, text_content):
         # Dzielenie tekstu na fragmenty
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
         text_chunks = text_splitter.split_text(text_content)
 
-        # Tworzenie osadzeń (embeddings)
-        embeddings_model = OpenAIEmbeddings(api_key=self.openai_api_key)
-        embeddings = [embeddings_model.embed_text(chunk) for chunk in text_chunks]
+        # Tworzenie obiektów dokumentów z fragmentów tekstu
+        documents = [Document(page_content=chunk) for chunk in text_chunks]
 
-        # Tworzenie przestrzeni FAISS
-        faiss_index = FAISS()
-        faiss_index.add_vectors(embeddings)
+        # Tworzenie przestrzeni FAISS z dokumentów
+        vectorstore = FAISS.from_documents(documents=documents, embedding=OpenAIEmbeddings(api_key=self.api_key))
 
         # Tworzenie łańcucha QA
-        chat_model = ChatOpenAI(api_key=self.openai_api_key)
-        retrieval_qa = RetrievalQA(retriever=faiss_index, chat_model=chat_model)
+        llm = ChatOpenAI(api_key=self.api_key) 
+        
+        # https://smith.langchain.com/hub/rlm/rag-prompt
+        # prompt = hub.pull("rlm/rag-prompt")
+        
+        prompt = ChatPromptTemplate.from_messages([("human", "Jesteś asystentem odpowiadającym na pytania. Użyj kontekstu, aby odpowiedzieć na pytanie. Użyj maksymalnie jednego zdania i utrzymaj odpowiedź zwięzłą i precyzyjną.  Question: {question} Context: {context} Answer:"),])
 
-        return retrieval_qa
+        def format_docs(docs):
+            return "\n\n".join(doc.page_content for doc in docs)
+
+
+        qa_chain = (
+            {
+                "context": vectorstore.as_retriever() | format_docs,
+                "question": RunnablePassthrough(),
+            }
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
+        return qa_chain
 
 class Answerer:
     
-    def __init__(self, qa_chain, url_question, wrong_answers_file='wrong_answers.json'):
+    def __init__(self, qa_chain, url_question):
         self.qa_chain = qa_chain
         self.url_question = url_question
-        self.wrong_answers_file = wrong_answers_file
         self.questions = self.load_questions()
-        self.wrong_answers = self.load_wrong_answers()
 
     def load_questions(self):
         """Pobiera pytania z URL-a i zapisuje je w słowniku."""
@@ -176,26 +198,70 @@ class Answerer:
             print(f"Error fetching questions: {e}")
             return {}
 
-    def load_wrong_answers(self):
-        """Wczytuje wcześniejsze błędne odpowiedzi z pliku."""
-        if os.path.exists(self.wrong_answers_file):
-            with open(self.wrong_answers_file, 'r') as file:
-                return json.load(file)
-        return {}
-
     def generate_answers(self):
         """Generuje odpowiedzi na pytania."""
         answers = {}
+        print(self.questions)
         for q_id, question in self.questions.items():
-            prompt = question
-            if q_id in self.wrong_answers:
-                wrong_context = self.wrong_answers[q_id]
-                prompt += f"\n\nPrevious wrong answers: {wrong_context}"
-            
+            prompt = question        
             # Generate answer using qa_chain
-            answer = self.qa_chain.ask(prompt)
-            answers[q_id] = answer
+            answer = self.qa_chain.invoke(prompt)
+            answers[q_id.strip()] = answer.strip()
         return answers
+    
+    def generate_answers_without_qa(self):
+        """Generuje odpowiedzi na pytania."""
+        answers = {}
+        print(self.questions)
+        for q_id, question in self.questions.items():
+            prompt = question        
+            # Generate answer using qa_chain
+            answer = self.qa_chain.invoke(prompt)
+            answers[q_id.strip()] = answer.strip()
+        return answers
+    
+class SimpleAnswerer:
+    
+    def __init__(self, url_question, client, context):
+        self.client = client
+        self.context = context
+        self.url_question = url_question
+        self.questions = self.load_questions()
+
+    def load_questions(self):
+        """Pobiera pytania z URL-a i zapisuje je w słowniku."""
+        try:
+            response = requests.get(self.url_question)
+            response.raise_for_status()
+            questions_data = response.text.splitlines()
+            questions = {}
+            for line in questions_data:
+                if '=' in line:
+                    q_id, question = line.split('=', 1)
+                    questions[q_id.strip()] = question.strip()
+            return questions
+        except requests.RequestException as e:
+            print(f"Error fetching questions: {e}")
+            return {}
+    
+    def generate_answers_without_qa(self):
+        """Generuje odpowiedzi na pytania."""
+        answers = {}
+        print(self.questions)
+        for q_id, question in self.questions.items():
+            # Use GPT-4o to generate the answer
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question. Use one sentence and keep the answer concise."},
+                    {"role": "user", "content": self.context},
+                    {"role": "user", "content": question},
+                ],
+                max_tokens=1000,
+            )
+            answer = response.choices[0].message.content.strip()
+            answers[q_id.strip()] = answer
+        return answers  
 
 def main():
     # Ładowanie zmiennych środowiskowych z pliku .env
@@ -203,16 +269,39 @@ def main():
 
     # Przykład dostępu do zmiennej środowiskowej
     openai_api_key = os.getenv('OPENAI_API_KEY')
+    report_api_key = os.getenv('REPORT_API_KEY')
+
     url_article = os.getenv('URL_ARTICLE')
+    url_question = os.getenv('URL_QUESTION') 
+    url_answer = os.getenv('URL_ANSWER')   
     dir = os.getenv('DIR')
-    print(dir)
+
 
     client = OpenAI(api_key=openai_api_key)
     
-    index_html = IndexHtml(client)
-    text_content = index_html.index_webpage(url_article, dir)
-    # print(text_content)
-  
+    # index_html = IndexHtml(client)
+    # text_content = index_html.index_webpage(url_article, dir)
+    # # print(text_content)
+    
+    # knowledge_db = KnowledgeDb(api_key=openai_api_key)
+    # qa_chain = knowledge_db.prepare_knowledge_base(text_content)
+    
+    # answerer = Answerer(qa_chain, url_question)
+    # answers = answerer.generate_answers()
+    # print(answers)
+    
+    
+    #wersja z zastosowaniem simple answerera działa od strzała
+    
+    with open("C:\\Users\\kamyk\\Documents\\01_PROJECTS\\AI_DEVS_3\\aidevs3_s02e05\\temp\\context.txt", 'r', encoding='utf-8') as file:
+        context = file.read()
+    print(context)
+    simple_answerer = SimpleAnswerer(url_question, client, context )
+    answers = simple_answerer.generate_answers_without_qa()
+    print(answers)
+    report_sender = ReportSenderAnswerJson(report_api_key,"arxiv",url_answer)
+    report_sender.send_report(answers)
+    
 if __name__ == "__main__":
     main()
 
